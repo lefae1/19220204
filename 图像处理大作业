@@ -45,3 +45,421 @@ end
 
 
 % --- Executes just before work is made visible.
+function work_OpeningFcn(hObject, eventdata, handles, varargin)
+% This function has no output args, see OutputFcn.
+% hObject    handle to figure
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+% varargin   command line arguments to work (see VARARGIN)
+
+% Choose default command line output for work
+handles.output = hObject;
+
+% Update handles structure
+guidata(hObject, handles);
+
+% UIWAIT makes work wait for user response (see UIRESUME)
+% uiwait(handles.figure1);
+
+
+% --- Outputs from this function are returned to the command line.
+function varargout = work_OutputFcn(hObject, eventdata, handles) 
+% varargout  cell array for returning output args (see VARARGOUT);
+% hObject    handle to figure
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+
+% Get default command line output from handles structure
+varargout{1} = handles.output;
+
+
+% --- Executes on button press in pushbutton1.
+
+function pushbutton1_Callback(hObject, eventdata, handles)
+global I
+[filename,pathname]=uigetfile('*jpg','选择图片');
+path=[pathname filename];
+I=imread(path);
+cla(handles.axes1); 
+axes(handles.axes1)
+imshow(I)
+
+
+% --- Executes on button press in pushbutton2.
+function pushbutton2_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton2 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+
+global I
+counts = imhist(I);
+cla(handles.axes2);
+axes(handles.axes2);
+bar(counts);
+xlabel('灰度值');
+ylabel('像素个数');
+title('图片灰度直方图');
+ xlim([0 255]);
+  grid on;
+
+% --- Executes on button press in pushbutton3.
+function pushbutton3_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton3 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global I
+
+J = histeq(I);
+cla(handles.axes1);
+axes(handles.axes1);
+imshow(J);
+title('直方图均衡化后的图像');
+[counts_eq, bins_eq] = imhist(J);
+cla(handles.axes2);
+axes(handles.axes2);
+bar(bins_eq, counts_eq);
+xlabel('灰度值');
+ylabel('像素个数');
+title('直方图均衡化后图像灰度直方图');
+
+
+% --- Executes on button press in pushbutton4.
+function pushbutton4_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton4 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global I
+I_reference = uint8(linspace(0, 255, numel(I)));
+I_reference = reshape(I_reference, size(I));
+
+I_matched = imhistmatch(I, I_reference);
+cla(handles.axes1);
+axes(handles.axes1);
+imshow(I_matched);
+title('直方图匹配后的图像');
+[counts_matched, bins_matched] = imhist(I_matched);
+cla(handles.axes2);
+axes(handles.axes2);
+bar(bins_matched, counts_matched);
+xlabel('灰度值');
+ylabel('像素个数');
+title('匹配后图像灰度直方图');
+
+
+% --- Executes on button press in pushbutton5.
+function pushbutton5_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton5 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global M
+global M_gray
+[filename,pathname]=uigetfile('*jpg','选择图片');
+path=[pathname filename];
+M=imread(path);
+cla(handles.axes3); 
+axes(handles.axes3);
+imshow(M);
+title('原图');
+M_gray=rgb2gray(M);
+cla(handles.axes4); 
+axes(handles.axes4)
+imshow(M_gray);
+title('灰度化');
+
+
+
+
+
+% --- Executes on button press in pushbutton6.
+function pushbutton6_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton6 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global M_gray
+a = 2;
+b = 1;
+M_linear = a * M_gray + b;
+M_linear = uint8(mat2gray(M_linear) * 255);
+cla(handles.axes3);
+axes(handles.axes3);
+imshow(M_linear);
+title('线性变换增强后的图像');
+[counts_linear, bins_linear] = imhist(M_linear);
+cla(handles.axes4);
+axes(handles.axes4);
+bar(bins_linear, counts_linear);
+xlabel('灰度值');
+ylabel('像素个数');
+title('线性变换后图像灰度直方图');
+
+
+% --- Executes on button press in pushbutton7.
+function pushbutton7_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton7 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global M_gray
+c = 2;
+M_log = c * log(2 + double(M_gray));
+M_log = uint8(mat2gray(M_log) * 255);
+cla(handles.axes3);
+axes(handles.axes3);
+imshow(M_log);
+title('对数变换增强后的图像');
+[counts_log, bins_log] = imhist(M_log);
+cla(handles.axes4);
+axes(handles.axes4);
+bar(bins_log, counts_log);
+xlabel('灰度值');
+ylabel('像素个数');
+title('对数变换后图像灰度直方图');
+
+
+% --- Executes on button press in pushbutton8.
+function pushbutton8_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton8 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global M_gray
+d = 1.5;
+M_exponential = exp(d * double(M_gray));
+M_exponential = uint8(mat2gray(M_exponential) * 255);
+cla(handles.axes3);
+axes(handles.axes3);
+imshow(M_exponential);
+title('指数变换增强后的图像');
+[counts_exponential, bins_exponential] = imhist(M_exponential);
+cla(handles.axes4);
+axes(handles.axes4);
+bar(bins_exponential, counts_exponential);
+xlabel('灰度值');
+ylabel('像素个数');
+title('指数变换后图像灰度直方图');
+
+
+% --- Executes on button press in pushbutton9.
+function pushbutton9_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton9 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global M
+[originalHeight, originalWidth, ~] = size(M);
+    
+    % 缩小一半的尺寸
+    newHeight = floor(originalHeight / 2);
+    newWidth = floor(originalWidth / 2);
+    
+    % 使用最近邻插值方法缩小图像
+    % 注意：这里使用imresize函数，但指定了'nearest'插值方法
+    M_scaled = imresize(M, [newHeight, newWidth], 'nearest');
+    
+cla(handles.axes3); 
+axes(handles.axes3);
+imshow(M);
+title('原图');
+cla(handles.axes4);
+axes(handles.axes4);
+imshow(M_scaled);
+title('缩放变换后的图像');
+
+% --- Executes on button press in pushbutton10.
+function pushbutton10_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton10 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global M
+M_rotated = imrotate(M, 90);
+cla(handles.axes3); 
+axes(handles.axes3);
+imshow(M);
+title('原图');
+cla(handles.axes4);
+axes(handles.axes4);
+imshow(M_rotated);
+title('旋转变换后的图像');
+
+
+% --- Executes on button press in pushbutton11.
+function pushbutton11_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton11 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global M
+noiseParam = str2double(get(handles.noiseParamEdit, 'String'));
+    
+    % 检查输入的有效性（可选）
+    if isnan(noiseParam) || ~isnumeric(noiseParam)
+        error('Invalid noise parameter input!');
+    end
+ M_noisy = imnoise(M, 'gaussian', 0, noiseParam^2);
+cla(handles.axes3); 
+axes(handles.axes3);
+imshow(M);
+title('原图');
+cla(handles.axes4);
+axes(handles.axes4);
+imshow(M_noisy);
+title('添加高斯噪声后的图像');
+
+
+% --- Executes on button press in pushbutton14.
+function pushbutton14_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton14 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global M
+noiseParam = str2double(get(handles.noiseParamEdit, 'String'));
+    
+    % 检查输入的有效性（可选）
+    if isnan(noiseParam) || ~isnumeric(noiseParam)
+        error('Invalid noise parameter input!');
+    end
+M_noisy = imnoise(M, 'salt & pepper', abs(noiseParam));
+cla(handles.axes3); 
+axes(handles.axes3);
+imshow(M);
+title('原图');
+cla(handles.axes4);
+axes(handles.axes4);
+imshow(M_noisy);
+title('添加椒盐噪声后的图像');
+
+
+% --- Executes on button press in pushbutton15.
+function pushbutton15_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton15 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+% 定义Robert算子
+global M_gray
+filterX = [-1 0; 0 1];
+filterY = [0 -1; 1 0];
+% 计算梯度
+Gx = imfilter(double(M_gray), filterX, 'replicate');
+Gy = imfilter(double(M_gray), filterY, 'replicate');
+% 计算梯度幅值
+G = sqrt(Gx.^2 + Gy.^2);
+% 归一化到0-255范围
+G = uint8(255 * mat2gray(G));
+cla(handles.axes3); 
+axes(handles.axes3);
+imshow(M_gray);
+title('原图');
+cla(handles.axes4);
+axes(handles.axes4);
+imshow(G);
+title('Robert算子边缘提取');
+
+
+% --- Executes on button press in pushbutton16.
+function pushbutton16_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton16 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+ % 定义Prewitt算子
+global M_gray
+filterX = [-1 0 1; -1 0 1; -1 0 1];
+filterY = [-1 -1 -1; 0 0 0; 1 1 1];
+% 计算梯度
+Gx = imfilter(double(M_gray), filterX, 'replicate');
+Gy = imfilter(double(M_gray), filterY, 'replicate');
+% 计算梯度幅值（也可以使用梯度方向等其他表示方法）
+G = sqrt(Gx.^2 + Gy.^2);
+G = uint8(G); % 简单转换为uint8，可能导致数据截断
+cla(handles.axes3); 
+axes(handles.axes3);
+imshow(M_gray);
+title('原图');
+cla(handles.axes4);
+axes(handles.axes4);
+imshow(G);
+title('Prewitt算子边缘提取');
+
+
+% --- Executes on button press in pushbutton17.
+function pushbutton17_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton17 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+% 定义Sobel算子
+global M_gray
+filterX = [-1 0 1; -2 0 2; -1 0 1];
+filterY = [-1 -2 -1; 0 0 0; 1 2 1]'; % 注意：这里使用了转置来匹配MATLAB的imfilter函数
+% 计算梯度
+Gx = imfilter(double(M_gray), filterX, 'replicate');
+Gy = imfilter(double(M_gray), filterY, 'replicate');
+% 计算梯度幅值（也可以计算梯度方向等其他表示方法）
+G = sqrt(Gx.^2 + Gy.^2);
+% 归一化到0-255范围并转换为uint8类型（可选，但通常为了显示需要这样做）
+G = uint8(255 * mat2gray(G));
+cla(handles.axes3); 
+axes(handles.axes3);
+imshow(M_gray);
+title('原图');
+cla(handles.axes4);
+axes(handles.axes4);
+imshow(G);
+title('Sobel算子边缘提取');        
+
+
+% --- Executes on button press in pushbutton18.
+function pushbutton18_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton18 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global M_gray
+% 定义拉普拉斯算子滤波器核
+filter = [0 -1 0; -1 4 -1; 0 -1 0]; % 这是一个常见的拉普拉斯核
+% 定义拉普拉斯算子滤波器核
+G = imfilter(double(M_gray), filter, 'replicate');
+G_display = uint8(255 * (G - min(G(:))) / (max(G(:)) - min(G(:))));
+cla(handles.axes3); 
+axes(handles.axes3);
+imshow(M_gray);
+title('原图');
+cla(handles.axes4);
+axes(handles.axes4);
+imshow(G);
+title('拉普拉斯算子边缘提取');  
+colormap(gray); % 确保以灰度显示
+
+
+% --- Executes on button press in pushbutton19.
+function pushbutton19_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton19 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global M_gray
+global M_binary
+threshold = graythresh(M_gray) * 255; % 使用Otsu方法计算阈值（针对8位灰度图像）
+M_binary= imbinarize(M_gray, threshold / 255); % 将图像二值化
+
+% 显示分割结果
+cla(handles.axes3); 
+axes(handles.axes3);
+imshow(M_gray);
+title('原图');
+cla(handles.axes4);
+axes(handles.axes4);
+imshow(M_binary);
+title('Extracted Target');
+ colormap(gray);
+
+
+% --- Executes on button press in pushbutton20.
+function pushbutton20_Callback(hObject, eventdata, handles)
+% hObject    handle to pushbutton20 (see GCBO)
+% eventdata  reserved - to be defined in a future version of MATLAB
+% handles    structure with handles and user data (see GUIDATA)
+global M_gray
+global M_binary
+% LBP特征提取
+lbpFeaturesOriginal = extractLBPFeatures(M_gray);
+% HOG特征提取（需要Computer Vision Toolbox）
+hogFeaturesOriginal = extractHOGFeatures(M_gray);
+% 提取目标图像的LBP和HOG特征
+lbpFeaturesTarget = extractLBPFeatures(M_binary);
+hogFeaturesTarget = extractHOGFeatures(M_binary);
+save('features_original.mat', 'lbpFeaturesOriginal', 'hogFeaturesOriginal');
+save('features_target.mat', 'lbpFeaturesTarget', 'hogFeaturesTarget');
+uimsg('Features extracted successfully!');
