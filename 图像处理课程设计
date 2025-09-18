@@ -1,0 +1,1257 @@
+import os
+import json
+import random
+import numpy as np
+import paddle
+import paddle.nn as nn
+from paddle.io import Dataset, DataLoader
+import cv2
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+import time
+from pycocotools.coco import COCO
+from tqdm import tqdm
+import math
+# 设置随机种子确保可复现性
+paddle.seed(42)
+np.random.seed(42)
+random.seed(42)
+
+# 数据集路径配置
+DATA_DIR = "/home/aistudio/bee_dataset"
+TRAIN_DIR = os.path.join(DATA_DIR, "train")
+VALID_DIR = os.path.join(DATA_DIR, "valid")
+TEST_DIR = os.path.join(DATA_DIR, "test")
+
+# 标注文件路径
+TRAIN_ANNOTATION = os.path.join(TRAIN_DIR, "_annotations.coco.json")
+VALID_ANNOTATION = os.path.join(VALID_DIR, "_annotations.coco.json")
+TEST_ANNOTATION = os.path.join(TEST_DIR, "_annotations.coco.json")
+
+# 超参数配置
+BATCH_SIZE = 8
+LEARNING_RATE = 0.0001
+NUM_EPOCHS = 10
+IMG_SIZE = 640  # YOLOv5标准输入尺寸
+NUM_CLASSES = 1  # 仅检测蜜蜂一个类别
+ANCHORS = [
+    10, 13, 16, 30, 33, 23,    # 小目标锚框
+    30, 61, 62, 45, 59, 119,   # 中目标锚框
+    116, 90, 156, 198, 373, 326 # 大目标锚框
+]
+
+# 修正锚框掩码：每个尺度使用对应组的3个锚框
+ANCHOR_MASKS = [[0, 1, 2], [3, 4, 5], [6, 7, 8]]  # 小/中/大尺度分别对应3个锚框
+
+# 图像增强函数
+def apply_gray_scale(img):
+    """转换为灰度图并返回三通道图像"""
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+
+def apply_gamma_correction(img, gamma=1.0):
+    """应用伽马校正"""
+    inv_gamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** inv_gamma) * 255 
+                     for i in np.arange(0, 256)]).astype("uint8")
+    return cv2.LUT(img, table)
+
+def apply_smoothing(img, kernel_size=5):
+    """应用高斯平滑滤波"""
+    return cv2.GaussianBlur(img, (kernel_size, kernel_size), 0)
+
+def apply_sharpening(img, strength=1.0):
+    """应用锐化滤波"""
+    kernel = np.array([[-1, -1, -1],
+                       [-1, 9, -1],
+                       [-1, -1, -1]]) * strength
+    sharpened = cv2.filter2D(img, -1, kernel)
+    # 确保像素值在[0,255]范围内
+    return np.clip(sharpened, 0, 255).astype(np.uint8)
+
+def apply_augmentations(img):
+    """应用数据增强，避免增强效果相互抵消"""
+    # 随机水平翻转
+    if random.random() < 0.5:
+        img = cv2.flip(img, 1)
+    
+    # 随机选择一种增强方式应用，避免冲突
+    aug_choice = random.choice([0, 1, 2, 3, 4])  
+    if aug_choice == 1:
+        img = apply_gray_scale(img)
+    elif aug_choice == 2:
+        gamma = random.uniform(0.5, 1.5)
+        img = apply_gamma_correction(img, gamma)
+    elif aug_choice == 3:
+        kernel_size = random.choice([3, 5])
+        img = apply_smoothing(img, kernel_size)
+    elif aug_choice == 4:
+        strength = random.uniform(0.8, 1.2)
+        img = apply_sharpening(img, strength)
+    
+    return img
+def visualize_augmentations(dataset, num_samples=3):
+    """可视化数据增强效果对比"""
+    fig, axes = plt.subplots(num_samples, 2, figsize=(12, num_samples*5))
+    for i in range(num_samples):
+        # 随机取样本
+        idx = random.randint(0, len(dataset)-1)
+        img, _ = dataset[idx]
+        img_original = img.numpy().transpose((1,2,0))  # 原始图像
+        
+        # 重新加载原始图像
+        img_id = dataset.image_ids[idx]
+        img_info = dataset.coco.loadImgs(img_id)[0]
+        img_path = os.path.join(dataset.data_dir, img_info['file_name'])
+        img_raw = cv2.imread(img_path)
+        img_raw = cv2.cvtColor(img_raw, cv2.COLOR_BGR2RGB)
+        # 调整尺寸
+        h, w = img_raw.shape[:2]
+        scale = min(IMG_SIZE / w, IMG_SIZE / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img_raw = cv2.resize(img_raw, (new_w, new_h))
+        canvas = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
+        canvas[:new_h, :new_w] = img_raw
+        img_raw = canvas.astype('float32') / 255.0
+        
+        # 绘制对比图
+        axes[i][0].imshow(img_raw)
+        axes[i][0].set_title(f"Original Image {i+1}")
+        axes[i][0].axis('off')
+        
+        axes[i][1].imshow(img_original)
+        axes[i][1].set_title(f"Augmented Image {i+1}")
+        axes[i][1].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig('augmentation_examples.png')
+    plt.show()
+# 自定义数据集类
+class BeeDataset(Dataset):
+    def __init__(self, data_dir, annotation_file, img_size=640, is_train=True):
+        super(BeeDataset, self).__init__()
+        self.data_dir = data_dir
+        self.img_size = img_size
+        self.is_train = is_train
+        
+        # 加载COCO格式的标注
+        self.coco = COCO(annotation_file)
+        self.image_ids = self.coco.getImgIds()
+        
+        # 加载类别信息
+        self.categories = self.coco.loadCats(self.coco.getCatIds())
+        self.num_classes = len(self.categories)
+        
+    def __len__(self):
+        return len(self.image_ids)
+    
+    def __getitem__(self, idx):
+        img_id = self.image_ids[idx]
+        img_info = self.coco.loadImgs(img_id)[0]
+        
+        # 加载图像
+        img_path = os.path.join(self.data_dir, img_info['file_name'])
+        img = cv2.imread(img_path)
+        if img is None:
+            raise ValueError(f"无法读取图像: {img_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # 应用数据增强
+        if self.is_train:
+            img = apply_augmentations(img)
+        
+        # 调整图像大小并记录缩放比例
+        h, w = img.shape[:2]
+        scale = min(self.img_size / w, self.img_size / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = cv2.resize(img, (new_w, new_h))
+        
+        # 创建画布并粘贴图像（保持比例）
+        canvas = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+        canvas[:new_h, :new_w] = img
+        img = canvas
+        
+        # 归一化并转换格式
+        img = img.astype('float32') / 255.0
+        img = img.transpose((2, 0, 1))  # HWC to CHW
+        
+        # 获取标注信息
+        ann_ids = self.coco.getAnnIds(imgIds=img_id)
+        anns = self.coco.loadAnns(ann_ids)
+        
+        targets = []
+        for ann in anns:
+            # 获取边界框坐标 (x, y, width, height)
+            bbox = ann['bbox']
+            x, y, bbox_w, bbox_h = bbox
+            
+            # 调整边界框坐标以适应缩放和填充
+            x = x * scale + (self.img_size - new_w) // 2
+            y = y * scale + (self.img_size - new_h) // 2
+            bbox_w *= scale
+            bbox_h *= scale
+            
+            # 转换为YOLO格式 (center_x, center_y, width, height) 并归一化
+            center_x = (x + bbox_w / 2) / self.img_size
+            center_y = (y + bbox_h / 2) / self.img_size
+            norm_w = bbox_w / self.img_size
+            norm_h = bbox_h / self.img_size
+            
+            # 类别ID
+            class_id = ann['category_id'] - 1
+            
+            targets.append([class_id, center_x, center_y, norm_w, norm_h])
+        
+        # 转换为paddle tensor
+        img = paddle.to_tensor(img)
+        targets = paddle.to_tensor(targets) if targets else paddle.zeros((0, 5))
+        
+        return img, targets
+
+# 自定义collate函数处理可变长度的目标框
+def collate_fn(batch):
+    images = []
+    targets_list = []
+    
+    for batch_idx, (img, tgt) in enumerate(batch):
+        images.append(img)
+        
+        # 处理没有目标的情况
+        if tgt.shape[0] == 0:
+            continue
+            
+        # 为每个目标添加批次索引，统一转换为FLOAT32类型
+        batch_indices = paddle.full((tgt.shape[0], 1), batch_idx, dtype=paddle.float32)
+        # 分离类别ID和边界框，将类别ID转换为FLOAT32类型
+        class_ids = tgt[:, 0:1].cast(paddle.float32)
+        bboxes = tgt[:, 1:5].cast(paddle.float32)
+        # 拼接所有组件
+        tgt = paddle.concat([batch_indices, class_ids, bboxes], axis=1)
+        targets_list.append(tgt)
+    
+    # 堆叠图像
+    images = paddle.stack(images)
+    
+    # 处理所有图像都没有目标的情况
+    if len(targets_list) == 0:
+        targets = paddle.zeros((0, 6), dtype=paddle.float32)
+    else:
+        targets = paddle.concat(targets_list, axis=0)
+    
+    return images, targets
+
+
+
+# 创建数据加载器
+def create_data_loaders():
+    train_dataset = BeeDataset(TRAIN_DIR, TRAIN_ANNOTATION, IMG_SIZE, is_train=True)
+    val_dataset = BeeDataset(VALID_DIR, VALID_ANNOTATION, IMG_SIZE, is_train=False)
+    test_dataset = BeeDataset(TEST_DIR, TEST_ANNOTATION, IMG_SIZE, is_train=False)
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=2,
+        collate_fn=collate_fn
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=2,
+        collate_fn=collate_fn
+    )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=2,
+        collate_fn=collate_fn
+    )
+    
+    return train_loader, val_loader, test_loader
+
+# 定义YOLOv5核心组件
+class ConvBNLayer(nn.Layer):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, groups=1, act=True, act_type="leaky_relu"):
+        
+        super(ConvBNLayer, self).__init__()
+        self.conv = nn.Conv2D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=(kernel_size - 1) // 2,
+            groups=groups,
+            bias_attr=True  
+        )
+       
+        if act_type not in ["leaky_relu", "relu"]:
+            raise ValueError(f"Paddle 1.2.0不支持{act_type}，请使用leaky_relu或relu")
+        self.act = self._get_activation(act_type) if act else nn.Identity()
+
+    def _get_activation(self, act_type):
+        if act_type == "leaky_relu":
+            return nn.LeakyReLU(negative_slope=0.1)  # 最稳定的选择
+        elif act_type == "relu":
+            return nn.ReLU()
+
+    def forward(self, x):
+        
+        assert not paddle.isnan(x).any(), f"ConvBNLayer输入含nan！输入形状: {x.shape}"
+        assert not paddle.isinf(x).any(), f"ConvBNLayer输入含inf！输入形状: {x.shape}"
+        
+        x_max = x.max().item()
+        x_min = x.min().item()
+        assert x_max < 1e5 and x_min > -1e5, f"ConvBNLayer输入值异常！范围[{x_min:.2f}, {x_max:.2f}]"
+        
+        # 卷积计算
+        x = self.conv(x)
+        x = paddle.clip(x, -1e4, 1e4)
+        
+        assert not paddle.isnan(x).any(), "ConvBNLayer卷积后含nan"
+        assert not paddle.isinf(x).any(), "ConvBNLayer卷积后含inf"
+        
+        # 激活函数
+        x = self.act(x)
+        
+        
+        assert not paddle.isnan(x).any(), "ConvBNLayer输出含nan"
+        assert not paddle.isinf(x).any(), "ConvBNLayer输出含inf"
+        
+        return x
+
+class Bottleneck(nn.Layer):
+    def __init__(self, in_channels, out_channels, shortcut=True, groups=1, expansion=0.5):
+        super(Bottleneck, self).__init__()
+        hidden_channels = int(out_channels * expansion)
+        self.conv1 = ConvBNLayer(in_channels, hidden_channels, 1, act=True)
+        self.conv2 = ConvBNLayer(hidden_channels, out_channels, 3, groups=groups, act=True)
+        self.add = shortcut and in_channels == out_channels
+
+    def forward(self, x):
+        return x + self.conv2(self.conv1(x)) if self.add else self.conv2(self.conv1(x))
+
+
+class C3(nn.Layer):
+    def __init__(self, in_channels, out_channels, num_blocks, shortcut=True):
+        super(C3, self).__init__()
+        mid_channels = out_channels // 2
+        
+        self.conv1 = ConvBNLayer(in_channels, mid_channels, 1, act=True, act_type="leaky_relu")
+        self.conv2 = ConvBNLayer(in_channels, mid_channels, 1, act=True, act_type="leaky_relu")
+        self.conv3 = ConvBNLayer(mid_channels * 2, out_channels, 1, act=True, act_type="leaky_relu")
+        # 定义残差块序列）
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(mid_channels, mid_channels, shortcut=shortcut) for _ in range(num_blocks)]
+        )
+
+    def forward(self, x):
+        
+        return self.conv3(paddle.concat([self.blocks(self.conv1(x)), self.conv2(x)], axis=1))
+class ResidualBlock(nn.Layer):
+    def __init__(self, in_channels, out_channels, shortcut=True):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = ConvBNLayer(in_channels, out_channels, 3, act=True, act_type="leaky_relu")
+        self.conv2 = ConvBNLayer(out_channels, out_channels, 3, act=True, act_type="leaky_relu")
+        self.shortcut = shortcut
+
+    def forward(self, x):
+        residual = x
+        x = self.conv1(x)
+        x = self.conv2(x)
+        if self.shortcut:
+            x += residual
+        return x
+class YOLOv5(nn.Layer):
+    def __init__(self, num_classes=1, anchors=ANCHORS):
+        super(YOLOv5, self).__init__()
+        self.num_classes = num_classes
+        
+        self.num_anchors = 3  # 每个尺度固定3个锚框
+        
+        self.anchors = paddle.to_tensor(anchors, dtype=paddle.float32).reshape([-1, 2])
+        
+        # 主干网络
+        self.backbone = nn.Sequential(
+            ConvBNLayer(3, 32, 6, 2, act=True, act_type="leaky_relu"),  # 0
+            ConvBNLayer(32, 64, 3, 2, act=True, act_type="leaky_relu"),  # 1
+            C3(64, 64, 1),  # 2（需确保C3内部的ConvBNLayer也用leaky_relu）
+            ConvBNLayer(64, 128, 3, 2, act=True, act_type="leaky_relu"),  # 3
+            C3(128, 128, 3),  # 4
+            ConvBNLayer(128, 256, 3, 2, act=True, act_type="leaky_relu"),  # 5
+            C3(256, 256, 6),  # 6
+            ConvBNLayer(256, 512, 3, 2, act=True, act_type="leaky_relu"),  # 7
+            C3(512, 512, 3),  # 8
+            SPPF(512, 512),  # 9（SPPF内部已指定leaky_relu）
+        )
+        
+        # 颈部网络
+        self.neck = nn.Sequential(
+            ConvBNLayer(512, 256, 1, act=True, act_type="leaky_relu"),  # 0
+            nn.Upsample(scale_factor=2, mode='nearest'),  # 1
+            C3(512, 256, 1, shortcut=False),  # 2
+            ConvBNLayer(256, 128, 1, act=True, act_type="leaky_relu"),  # 3
+            nn.Upsample(scale_factor=2, mode='nearest'),  # 4
+            C3(256, 128, 1, shortcut=False),  # 5
+            ConvBNLayer(128, 128, 3, 2, act=True, act_type="leaky_relu"),  # 6
+            C3(384, 256, 1, shortcut=False),  # 7
+            ConvBNLayer(256, 256, 3, 2, act=True, act_type="leaky_relu"),  # 8
+            C3(768, 512, 1, shortcut=False),  # 9
+        )
+        
+        # 检测头
+        self.head_small = nn.Conv2D(128, self.num_anchors*(5 + num_classes), 1)  # 80×80
+        self.head_medium = nn.Conv2D(256, self.num_anchors*(5 + num_classes), 1) # 40×40
+        self.head_large = nn.Conv2D(512, self.num_anchors*(5 + num_classes), 1)  # 20×20
+
+        # 初始化权重
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """增强BN层初始化稳定性"""
+        for m in self.sublayers():
+            if isinstance(m, nn.Conv2D):
+                paddle.nn.initializer.XavierUniform()(m.weight)
+                if m.bias is not None:
+                    paddle.nn.initializer.Constant(0.0)(m.bias)
+            elif isinstance(m, nn.BatchNorm2D):
+                # 核心修复：手动初始化BN层的running_mean和running_var
+                paddle.nn.initializer.Constant(0.0)(m.running_mean)
+                paddle.nn.initializer.Constant(1.0)(m.running_var)
+                # 权重和偏置初始化
+                paddle.nn.initializer.Constant(1.0)(m.weight)
+                paddle.nn.initializer.Constant(0.0)(m.bias)
+
+    def forward(self, x):
+        # 主干网络特征提取
+        x = self.backbone[0](x)       # 320×320, 32
+        x = self.backbone[1](x)       # 160×160, 64
+        x = self.backbone[2](x)       # 160×160, 64
+        x = self.backbone[3](x)       # 80×80, 128
+        x = self.backbone[4](x)       # 80×80, 128
+        feat80 = x                    # 保存80×80特征图（128通道）
+        
+        x = self.backbone[5](x)       # 40×40, 256
+        x = self.backbone[6](x)       # 40×40, 256
+        feat40 = x                    # 保存40×40特征图（256通道）
+        
+        x = self.backbone[7](x)       # 20×20, 512
+        x = self.backbone[8](x)       # 20×20, 512
+        x = self.backbone[9](x)       # 20×20, 512
+        feat20 = x                    # 保存20×20特征图（512通道）
+        assert not paddle.isnan(feat20).any(), "主干网络输出feat20出现nan"
+        
+        # 颈部网络特征融合
+        # 阶段1：20×20 → 40×40
+        x = self.neck[0](feat20)      # 20×20, 512→256
+        x = self.neck[1](x)           # 20×20→40×40, 256
+        x = paddle.concat([x, feat40], axis=1)  # 40×40, 256+256=512
+        assert not paddle.isnan(x).any(), "颈部阶段1 concat后出现nan"
+        neck_feat40 = self.neck[2](x) # 40×40, 512→256（保存颈部40×40特征）
+        
+        # 阶段2：40×40 → 80×80
+        x = self.neck[3](neck_feat40) # 40×40, 256→128
+        x = self.neck[4](x)           # 40×40→80×80, 128
+        x = paddle.concat([x, feat80], axis=1)  # 80×80, 128+128=256
+        assert not paddle.isnan(x).any(), "颈部阶段2 concat后出现nan"
+        out_80 = self.neck[5](x)      # 80×80, 256→128（小目标特征图）
+        
+        # 阶段3：80×80 → 40×40
+        x = self.neck[6](out_80)      # 80×80→40×40, 128→128
+        x = paddle.concat([x, neck_feat40], axis=1)  # 40×40, 128+256=384
+        assert not paddle.isnan(x).any(), "颈部阶段3 concat后出现nan"
+        out_40 = self.neck[7](x)      # 40×40, 384→256（中目标特征图）
+        
+        # 阶段4：40×40 → 20×20
+        x = self.neck[8](out_40)      # 40×40→20×20, 256→256
+        x = paddle.concat([x, feat20], axis=1)  # 20×20, 256+512=768
+        assert not paddle.isnan(x).any(), "颈部阶段4 concat后出现nan"
+        out_20 = self.neck[9](x)      # 20×20, 768→512（大目标特征图）
+        
+        # 检测头输出前检查
+        assert not paddle.isnan(out_80).any(), "out_80特征图出现nan"
+        assert not paddle.isnan(out_40).any(), "out_40特征图出现nan"
+        assert not paddle.isnan(out_20).any(), "out_20特征图出现nan"
+        
+        # 检测头输出
+        out80 = self.head_small(out_80)
+        out40 = self.head_medium(out_40)
+        out20 = self.head_large(out_20)
+        
+        # 输出前最终检查
+        assert not paddle.isnan(out80).any(), "尺度0（80×80）输出出现nan"
+        assert not paddle.isnan(out40).any(), "尺度1（40×40）输出出现nan"
+        assert not paddle.isnan(out20).any(), "尺度2（20×20）输出出现nan"
+        
+        return [out80, out40, out20]
+
+
+
+class SPPF(nn.Layer):
+    def __init__(self, in_channels, out_channels, k=5):
+        super(SPPF, self).__init__()
+        self.pool = nn.MaxPool2D(kernel_size=k, stride=1, padding=k//2)
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv2D(in_channels * 3, out_channels, 1, bias_attr=True),
+            nn.LeakyReLU(negative_slope=0.1)
+        )
+
+    def forward(self, x):
+        y1 = self.pool(x)
+        y2 = self.pool(y1)
+        concat_feat = paddle.concat([x, y1, y2], axis=1)
+        assert not paddle.isnan(concat_feat).any(), "SPPF拼接前含nan"
+        out = self.conv2(concat_feat)
+        assert not paddle.isnan(out).any(), "SPPF输出含nan"
+        return out
+
+
+
+
+# YOLOv5损失函数（基于CIoU）
+class YOLOLoss(nn.Layer):
+    def __init__(self, num_classes=1, anchors=ANCHORS, anchor_masks=ANCHOR_MASKS, img_size=640):
+        super(YOLOLoss, self).__init__()
+        self.num_classes = num_classes
+        self.anchors = paddle.to_tensor(anchors, dtype=paddle.float32)
+        self.anchor_masks = anchor_masks
+        
+        self.num_anchors = len(anchor_masks[0])  
+        self.img_size = img_size
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.ignore_thresh = 0.5  # 忽略阈值
+        self.lambda_box = 5.0      # 边界框损失权重
+        self.lambda_obj = 1.0      # 目标置信度损失权重
+        self.lambda_cls = 0.5      # 分类损失权重
+
+    def bbox_ciou(self, box1, box2):
+    
+    # box1: [N,4]，格式(x1,y1,x2,y2)
+    # box2: [N,4]，格式(x1,y1,x2,y2)
+        box1_x1 = box1[:, 0]
+        box1_y1 = box1[:, 1]
+        box1_x2 = box1[:, 2]
+        box1_y2 = box1[:, 3]
+        box2_x1 = box2[:, 0]
+        box2_y1 = box2[:, 1]
+        box2_x2 = box2[:, 2]
+        box2_y2 = box2[:, 3]
+
+    # 1. 计算交集
+        inter_x1 = paddle.fluid.layers.elementwise_max(box1_x1, box2_x1)
+        inter_y1 = paddle.fluid.layers.elementwise_max(box1_y1, box2_y1)
+        inter_x2 = paddle.fluid.layers.elementwise_min(box1_x2, box2_x2)
+        inter_y2 = paddle.fluid.layers.elementwise_min(box1_y2, box2_y2)
+    
+    # 计算交集宽度和高度
+        diff_x = inter_x2 - inter_x1
+        diff_y = inter_y2 - inter_y1
+        zero_x = paddle.fluid.layers.zeros_like(diff_x)
+        zero_y = paddle.fluid.layers.zeros_like(diff_y)
+        inter_w = paddle.fluid.layers.elementwise_max(zero_x, diff_x)
+        inter_h = paddle.fluid.layers.elementwise_max(zero_y, diff_y)
+        inter_area = inter_w * inter_h
+
+    # 2. 计算并集
+        box1_area = (box1_x2 - box1_x1) * (box1_y2 - box1_y1)
+        box2_area = (box2_x2 - box2_x1) * (box2_y2 - box2_y1)
+        union_area = box1_area + box2_area - inter_area
+
+    # 3. 计算IoU
+        iou = inter_area / (union_area + 1e-9)
+
+    # 4. 计算中心距离
+        box1_cx = (box1_x1 + box1_x2) / 2
+        box1_cy = (box1_y1 + box1_y2) / 2
+        box2_cx = (box2_x1 + box2_x2) / 2
+        box2_cy = (box2_y1 + box2_y2) / 2
+        center_dist = (box1_cx - box2_cx)**2 + (box1_cy - box2_cy)** 2
+
+    # 5. 计算最小外接矩形对角线长度
+        enclose_x1 = paddle.fluid.layers.elementwise_min(box1_x1, box2_x1)
+        enclose_y1 = paddle.fluid.layers.elementwise_min(box1_y1, box2_y1)
+        enclose_x2 = paddle.fluid.layers.elementwise_max(box1_x2, box2_x2)
+        enclose_y2 = paddle.fluid.layers.elementwise_max(box1_y2, box2_y2)
+        enclose_diag = (enclose_x2 - enclose_x1)**2 + (enclose_y2 - enclose_y1)** 2
+
+    # 6. 计算宽高比一致性
+        box1_w = box1_x2 - box1_x1
+        box1_h = box1_y2 - box1_y1
+        box2_w = box2_x2 - box2_x1
+        box2_h = box2_y2 - box2_y1
+    
+        v = (4 / (math.pi**2)) * paddle.fluid.layers.pow(
+            paddle.fluid.layers.atan(box1_w / box1_h) - paddle.fluid.layers.atan(box2_w / box2_h), 2
+        )
+        alpha = v / (1 - iou + v + 1e-9)
+
+    # 7. 计算CIoU
+        ciou = iou - (center_dist / (enclose_diag + 1e-9)) - alpha * v
+        return 1 - ciou  # 返回CIoU损失（1 - CIoU）
+
+    def build_targets(self, pred, targets, anchors, img_size):
+    
+        anchors = anchors.reshape([-1, 2])  # [3,2]（原图尺度）
+        num_anchors = anchors.shape[0]
+        batch_size = pred.shape[0]
+        grid_h = pred.shape[2]
+        grid_w = pred.shape[3]
+        stride = img_size / grid_h
+
+    # 初始化目标张量
+        target_cls = paddle.zeros([batch_size, num_anchors, grid_h, grid_w, self.num_classes], dtype=paddle.float32)
+        target_box = paddle.zeros([batch_size, num_anchors, grid_h, grid_w, 4], dtype=paddle.float32)
+        target_obj = paddle.zeros([batch_size, num_anchors, grid_h, grid_w], dtype=paddle.float32)
+        indices = []
+
+        if targets.shape[0] == 0:
+            return target_cls, target_box, target_obj, indices
+
+    # 分离目标中的批次索引、类别、边界框
+        batch_idx = targets[:, 0].astype(paddle.int64)
+        cls_idx = targets[:, 1].astype(paddle.int64)
+        gt_boxes = targets[:, 2:6] * img_size  # [N,4]（原图尺度：center_x, center_y, w, h）
+
+    # 转换为特征图尺度的坐标
+        gt_boxes_grid = gt_boxes / stride  # [N,4]
+        gt_center_x, gt_center_y = gt_boxes_grid[:, 0], gt_boxes_grid[:, 1]
+        gt_w, gt_h = gt_boxes_grid[:, 2], gt_boxes_grid[:, 3]
+
+    # 计算目标落在的网格索引
+        grid_x = paddle.floor(gt_center_x).astype(paddle.int64)
+        grid_y = paddle.floor(gt_center_y).astype(paddle.int64)
+
+    # 过滤超出网格范围的目标
+        valid_mask = (grid_x >= 0) & (grid_x < grid_w) & (grid_y >= 0) & (grid_y < grid_h)
+        valid_mask = valid_mask & (gt_w > 0) & (gt_h > 0)  
+        if not valid_mask.any():
+            return target_cls, target_box, target_obj, indices
+        if not valid_mask.any():
+            return target_cls, target_box, target_obj, indices
+        batch_idx, cls_idx, gt_center_x, gt_center_y, gt_w, gt_h, grid_x, grid_y = \
+            batch_idx[valid_mask], cls_idx[valid_mask], gt_center_x[valid_mask], gt_center_y[valid_mask], \
+            gt_w[valid_mask], gt_h[valid_mask], grid_x[valid_mask], grid_y[valid_mask]
+
+    # 锚框缩放为特征图尺度，并保持[3,2]形状
+        scaled_anchors = anchors / stride  # [3,2]（特征图尺度）
+    # 计算目标与锚框的IoU（基于宽高比）
+        gt_wh = paddle.stack([gt_w, gt_h], axis=1).reshape([-1, 1, 2])  # [N,1,2]
+        anchor_wh = scaled_anchors.reshape([1, num_anchors, 2])        # [1,3,2]
+        iou = self.box_iou(gt_wh, anchor_wh)  # [N,3]
+
+    # 找到每个目标的最佳匹配锚框
+        best_ious = paddle.max(iou, axis=1)
+        best_anchor_idx = paddle.argmax(iou, axis=1).astype(paddle.int64)
+
+    # 筛选正样本
+        positive_mask = best_ious > 0.5
+        if not positive_mask.any():
+            return target_cls, target_box, target_obj, indices
+        batch_idx, cls_idx, best_anchor_idx, gt_center_x, gt_center_y, gt_w, gt_h, grid_x, grid_y = \
+            batch_idx[positive_mask], cls_idx[positive_mask], best_anchor_idx[positive_mask], \
+            gt_center_x[positive_mask], gt_center_y[positive_mask], gt_w[positive_mask], gt_h[positive_mask], \
+            grid_x[positive_mask], grid_y[positive_mask]
+
+    # 记录正样本索引
+        indices = (batch_idx, best_anchor_idx, grid_y, grid_x)
+
+    # 设置目标张量的值
+        target_obj[batch_idx, best_anchor_idx, grid_y, grid_x] = 1
+
+    # 使用特征图尺度的scaled_anchors提取宽高，且索引方式适配Paddle 1.2.0
+    
+        scaled_anchor_w = paddle.fluid.layers.gather(scaled_anchors[:, 0], best_anchor_idx)  # [N]
+        scaled_anchor_h = paddle.fluid.layers.gather(scaled_anchors[:, 1], best_anchor_idx)  # [N]
+
+    # 边界框目标（tx, ty, tw, th）
+        target_box[batch_idx, best_anchor_idx, grid_y, grid_x, 0] = gt_center_x - grid_x.cast(paddle.float32)
+        target_box[batch_idx, best_anchor_idx, grid_y, grid_x, 1] = gt_center_y - grid_y.cast(paddle.float32)
+    # 用特征图尺度的锚框宽高计算tw/th，且用低版本API log
+        target_box[batch_idx, best_anchor_idx, grid_y, grid_x, 2] = paddle.fluid.layers.log(
+            gt_w / (scaled_anchor_w + 1e-4) + 1e-4  # 分母加1e-4避免除零，分子加1e-4避免log(0)
+        )
+        target_box[batch_idx, best_anchor_idx, grid_y, grid_x, 3] = paddle.fluid.layers.log(
+            gt_h / (scaled_anchor_h + 1e-4) + 1e-4
+        )
+
+    # 分类目标
+        target_cls[batch_idx, best_anchor_idx, grid_y, grid_x, cls_idx] = 1
+
+        return target_cls, target_box, target_obj, indices
+
+    def box_iou(self, box1, box2):
+        """计算两个边界框集合的IoU（基于宽高比，用于锚框匹配）"""
+        
+        area1 = box1[..., 0] * box1[..., 1]
+        area2 = box2[..., 0] * box2[..., 1]
+        wh = paddle.minimum(box1, box2)  # [N,M,2]
+        inter_area = wh[..., 0] * wh[..., 1]
+        return inter_area / (area1 + area2 - inter_area + 1e-9)
+
+    def forward(self, preds, targets):
+        total_loss = paddle.to_tensor(0.0, dtype=paddle.float32)
+        num_scales = len(preds)
+
+        for i in range(num_scales):
+            pred = preds[i]
+            batch_size, _, grid_h, grid_w = pred.shape
+            stride = self.img_size / grid_h
+            stride = stride.item() if isinstance(stride, paddle.Tensor) else stride
+            assert not paddle.isnan(pred).any(), f"尺度{i}的pred出现nan"
+        # 获取当前尺度锚框
+            mask = self.anchor_masks[i]
+            anchor_indices = []
+            for idx in mask:
+                anchor_indices.extend([idx*2, idx*2 + 1])
+            anchors = self.anchors[anchor_indices]
+            anchors = anchors.reshape([-1, 2])  # [3,2]
+
+        # 重塑预测结果
+            pred = pred.reshape([batch_size, self.num_anchors, 5 + self.num_classes, grid_h, grid_w])
+            pred = pred.transpose([0, 1, 3, 4, 2])  # [B,3,H,W,5+cls]
+            assert not paddle.isnan(pred).any(), f"尺度{i}的重塑后pred出现nan"
+        # 解析预测结果
+            pred_box = pred[..., :4]    # [B,3,H,W,4]
+            pred_obj = pred[..., 4]     # [B,3,H,W]
+            pred_cls = pred[..., 5:]    # [B,3,H,W,cls]
+
+        # 构建目标张量
+            target_cls, target_box, target_obj, indices = self.build_targets(
+                pred, targets, anchors, self.img_size
+            )
+            assert not paddle.isnan(target_box).any(), f"尺度{i}的target_box出现nan"
+        # 1. 边界框损失
+            box_loss = paddle.to_tensor(0.0, dtype=paddle.float32)
+            if not paddle.equal(box_loss, paddle.to_tensor(0.0)):
+                assert not paddle.isnan(box_loss), f"尺度{i}的box_loss出现nan"
+            if indices:
+                b_idx, a_idx, gy_idx, gx_idx = indices  # 均为1维张量[N]
+                N = b_idx.shape[0]  # 正样本数量
+
+            
+            # 1. 构建坐标矩阵：[N,4]，每一行是一个正样本的前4维坐标（b,a,gy,gx）
+            # 先将4个1维张量堆叠为[4,N]，再转置为[N,4]
+                coords = paddle.stack([b_idx, a_idx, gy_idx, gx_idx], axis=0)  # [4,N]
+                coords = paddle.fluid.layers.transpose(coords, perm=[1, 0])    # [N,4]
+
+            # 2. 用gather_nd提取正样本的预测框：[B,3,H,W,4] → [N,4]
+            
+                pred_box_pos = paddle.fluid.layers.gather_nd(pred_box, coords)  # 直接得到[N,4]，无需squeeze！
+
+            # 3. 用同样方法提取目标框：[B,3,H,W,4] → [N,4]
+                target_box_pos = paddle.fluid.layers.gather_nd(target_box, coords)  # [N,4]
+            # -------------------------------------------------------------------------
+
+            # 转换预测框为绝对坐标
+                pred_xy = paddle.fluid.layers.sigmoid(pred_box_pos[:, :2])  # [N,2]
+                pred_wh_exp = paddle.fluid.layers.exp(pred_box_pos[:, 2:4])  # [N,2]
+
+            # 用gather提取锚框宽高
+                anchor_w = paddle.fluid.layers.gather(anchors[:, 0], a_idx)  # [N]
+                anchor_h = paddle.fluid.layers.gather(anchors[:, 1], a_idx)  # [N]
+                pred_wh = paddle.stack([
+                    pred_wh_exp[:, 0] * anchor_w,
+                    pred_wh_exp[:, 1] * anchor_h
+                ], axis=1)  # [N,2]
+
+            # 特征图→原图尺度
+                pred_x1 = (gx_idx.cast(paddle.float32) + pred_xy[:, 0]) * stride - pred_wh[:, 0] / 2
+                pred_y1 = (gy_idx.cast(paddle.float32) + pred_xy[:, 1]) * stride - pred_wh[:, 1] / 2
+                pred_x2 = (gx_idx.cast(paddle.float32) + pred_xy[:, 0]) * stride + pred_wh[:, 0] / 2
+                pred_y2 = (gx_idx.cast(paddle.float32) + pred_xy[:, 1]) * stride + pred_wh[:, 1] / 2
+                pred_box_abs = paddle.stack([pred_x1, pred_y1, pred_x2, pred_y2], axis=1)  # [N,4]
+
+            # 转换目标框为绝对坐标
+                target_xy = target_box_pos[:, :2]  # [N,2]
+                target_wh_exp = paddle.fluid.layers.exp(target_box_pos[:, 2:4])  # [N,2]
+                target_wh = paddle.stack([
+                    target_wh_exp[:, 0] * anchor_w,
+                    target_wh_exp[:, 1] * anchor_h
+                ], axis=1)  # [N,2]
+                target_x1 = (gx_idx.cast(paddle.float32) + target_xy[:, 0]) * stride - target_wh[:, 0] / 2
+                target_y1 = (gx_idx.cast(paddle.float32) + target_xy[:, 1]) * stride - target_wh[:, 1] / 2
+                target_x2 = (gx_idx.cast(paddle.float32) + target_xy[:, 0]) * stride + target_wh[:, 0] / 2
+                target_y2 = (gx_idx.cast(paddle.float32) + target_xy[:, 1]) * stride + target_wh[:, 1] / 2
+                target_box_abs = paddle.stack([target_x1, target_y1, target_x2, target_y2], axis=1)  # [N,4]
+
+            # 计算CIoU损失
+                box_loss = self.bbox_ciou(pred_box_abs, target_box_abs).mean()
+
+        # 2. 目标置信度损失
+            obj_loss = self.bce(pred_obj, target_obj).mean()
+
+        # 3. 分类损失
+            cls_loss = paddle.to_tensor(0.0, dtype=paddle.float32)
+            if indices:
+                b_idx, a_idx, gy_idx, gx_idx = indices
+                N = b_idx.shape[0]
+
+            # 分类预测提取
+                coords = paddle.stack([b_idx, a_idx, gy_idx, gx_idx], axis=0)
+                coords = paddle.fluid.layers.transpose(coords, perm=[1, 0])
+                pred_cls_pos = paddle.fluid.layers.gather_nd(pred_cls, coords)  # [N,cls]
+
+            # 分类目标提取
+                target_cls_pos = paddle.fluid.layers.gather_nd(target_cls, coords)  # [N,cls]
+
+                cls_loss = self.bce(pred_cls_pos, target_cls_pos).mean()
+
+        # 累加损失
+            total_loss += self.lambda_box * box_loss + self.lambda_obj * obj_loss + self.lambda_cls * cls_loss
+
+        return total_loss
+
+# 非极大值抑制
+def nms(boxes, scores, iou_threshold=0.5):
+    """对预测框进行非极大值抑制"""
+    if len(boxes) == 0:
+        return []
+    
+    # 按置信度降序排列
+    sorted_indices = paddle.argsort(scores, descending=True)
+    boxes = boxes[sorted_indices]
+    scores = scores[sorted_indices]
+    
+    keep = []
+    while len(boxes) > 0:
+        # 保留置信度最高的框
+        keep.append(sorted_indices[0].numpy()[0])
+        # 计算与其他框的IoU
+        ious = box_iou(boxes[0:1], boxes[1:])
+        
+        # 保留IoU小于阈值的框
+        mask = ious < iou_threshold
+        boxes = boxes[1:][mask[0]]
+        sorted_indices = sorted_indices[1:][mask[0]]
+    
+    return keep
+
+def box_iou(box1, box2):
+    """计算两个边界框的IoU"""
+    box1_x1 = box1[:, 0]
+    box1_y1 = box1[:, 1]
+    box1_x2 = box1[:, 2]
+    box1_y2 = box1[:, 3]
+    box2_x1 = box2[:, 0]
+    box2_y1 = box2[:, 1]
+    box2_x2 = box2[:, 2]
+    box2_y2 = box2[:, 3]
+
+    # 修复1：修正变量名拼写（nter_y1→inter_y1）
+    inter_x1 = paddle.fluid.layers.maximum(box1_x1, box2_x1)
+    inter_y1 = paddle.fluid.layers.maximum(box1_y1, box2_y1)  
+    inter_x2 = paddle.fluid.layers.minimum(box1_x2, box2_x2)
+    inter_y2 = paddle.fluid.layers.minimum(box1_y2, box2_y2)
+    
+    inter_area = paddle.maximum(0, inter_x2 - inter_x1) * paddle.maximum(0, inter_y2 - inter_y1)
+    
+    # 修复2：使用正确的变量计算面积（x12→box1_x2，等）
+    area1 = (box1_x2 - box1_x1) * (box1_y2 - box1_y1)
+    area2 = (box2_x2 - box2_x1) * (box2_y2 - box2_y1)
+    union_area = area1 + area2 - inter_area + 1e-9
+    
+    return inter_area / union_area
+def clip_gradients(params, max_norm=10.0):
+    
+    total_norm = 0.0
+    # 计算所有参数的梯度范数平方和
+    for param in params:
+        if param.grad is not None:
+            param_norm = paddle.norm(param.grad)
+            total_norm += param_norm.item() **2
+    total_norm = math.sqrt(total_norm)
+    
+    # 计算缩放因子
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1.0:
+        # 裁剪所有参数的梯度
+        for param in params:
+            if param.grad is not None:
+                param.grad.set_value(param.grad * clip_coef)
+# 训练函数
+def train_model(model, train_loader, val_loader, optimizer, criterion, scheduler, num_epochs):
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    save_dir = "models"
+    os.makedirs(save_dir, exist_ok=True)
+    params = model.parameters()
+    for epoch in range(num_epochs):
+        # 训练阶段
+        model.train()
+        train_loss = 0
+        start_time = time.time()
+        
+        with tqdm(total=len(train_loader), desc=f'Epoch {epoch+1}/{num_epochs}') as pbar:
+            for batch_idx, (data, targets) in enumerate(train_loader):
+                optimizer.clear_grad()  # 清除历史梯度
+                if paddle.isnan(data).any():
+                    print(f"\nBatch {batch_idx} 输入含nan！")
+                    print(f"数据统计：均值={data.mean().item()}, 最小值={data.min().item()}, 最大值={data.max().item()}")
+                    raise ValueError("输入数据异常")
+                if paddle.isinf(data).any():
+                    print(f"\nBatch {batch_idx} 输入含inf！")
+                    raise ValueError("输入数据异常")
+                # 2. 检查像素范围
+                data_min = data.min().item()
+                data_max = data.max().item()
+                if not (data_min >= 0.0 and data_max <= 1.0):
+                    print(f"\nBatch {batch_idx} 像素范围异常：[{data_min:.4f}, {data_max:.4f}]")
+                    # 强制归一化
+                    data = paddle.clip(data, 0.0, 1.0)
+                    print("已强制裁剪至[0,1]")
+                outputs = model(data)
+                loss = criterion(outputs, targets)
+                loss.backward()  # 计算梯度
+                
+                # 手动裁剪梯度（
+                clip_gradients(params, max_norm=10.0)  # 调用自定义裁剪函数
+                
+                optimizer.step()  # 更新参数
+                
+                train_loss += loss.item()
+                pbar.set_postfix({'batch_loss': loss.item()})
+                pbar.update(1)
+                del outputs, loss
+                
+        # 学习率调度
+        scheduler.step()
+        
+        avg_train_loss = train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # 验证阶段
+        model.eval()
+        val_loss = 0
+        with paddle.no_grad():
+            for data, targets in val_loader:
+                outputs = model(data)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+        
+        # 保存最佳模型
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            paddle.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'epoch': epoch
+            }, os.path.join(save_dir, 'best_model.pdparams'))
+        
+        epoch_time = time.time() - start_time
+        print(f'Epoch {epoch+1}/{num_epochs} - '
+              f'Train Loss: {avg_train_loss:.4f}, '
+              f'Val Loss: {avg_val_loss:.4f}, '
+              f'Time: {epoch_time:.2f}s, '
+              f'LR: {optimizer.get_lr():.6f}')
+    
+    # 保存最终模型
+    paddle.save(model.state_dict(), os.path.join(save_dir, 'final_model.pdparams'))
+    return train_losses, val_losses
+def plot_loss_curves(train_losses, val_losses):
+    """绘制训练和验证损失曲线"""
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_losses)+1), train_losses, label='Train Loss', linewidth=2)
+    plt.plot(range(1, len(val_losses)+1), val_losses, label='Validation Loss', linewidth=2)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('Training and Validation Loss Curves', fontsize=14)
+    plt.legend(fontsize=10)
+    plt.grid(alpha=0.3)
+    plt.savefig('loss_curves.png')
+    plt.show()
+# 评估函数
+def evaluate_model(model, test_loader, img_size=640, conf_threshold=0.5, iou_threshold=0.5):
+    model.eval()
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+    all_preds = []
+    all_targets = []
+    
+    with paddle.no_grad():
+        for data, targets in tqdm(test_loader, desc='Evaluating'):
+            batch_size = data.shape[0]
+            outputs = model(data)
+            
+            # 收集所有目标
+            for i in range(batch_size):
+                mask = targets[:, 0] == i
+                if mask.any():
+                    all_targets.append(targets[mask][:, 1:6])  # 类别和边界框
+                else:
+                    all_targets.append(paddle.zeros((0, 5)))
+            
+            # 处理预测结果
+            preds = []
+            for out in outputs:
+                batch_size, _, grid_h, grid_w = out.shape
+                stride = img_size / grid_h
+                # 根据尺度索引和锚框掩码获取对应锚框
+                scale_idx = outputs.index(out)
+                mask = ANCHOR_MASKS[scale_idx]
+                anchors = paddle.to_tensor(ANCHORS, dtype=paddle.float32)[mask].reshape([-1, 2])
+                
+                # 重塑输出
+                out = out.reshape([batch_size, 3, 5 + NUM_CLASSES, grid_h, grid_w])
+                out = out.transpose([0, 1, 3, 4, 2])
+                
+                # 解析预测结果
+                xy = paddle.sigmoid(out[..., :2])
+                wh = paddle.exp(out[..., 2:4]) * anchors.reshape([1, 3, 1, 1, 2])
+                conf = paddle.sigmoid(out[..., 4:5])
+                cls = paddle.sigmoid(out[..., 5:])
+                
+                # 生成网格坐标
+                grid_x = paddle.arange(grid_w).reshape([1, 1, 1, grid_w, 1]).tile([batch_size, 3, grid_h, 1, 1])
+                grid_y = paddle.arange(grid_h).reshape([1, 1, grid_h, 1, 1]).tile([batch_size, 3, 1, grid_w, 1])
+                
+                # 计算绝对坐标
+                x = (xy[..., 0:1] + grid_x) * stride
+                y = (xy[..., 1:2] + grid_y) * stride
+                w = wh[..., 0:1]
+                h = wh[..., 1:2]
+                
+                # 转换为x1, y1, x2, y2格式
+                x1 = x - w / 2
+                y1 = y - h / 2
+                x2 = x + w / 2
+                y2 = y + h / 2
+                
+                # 拼接结果
+                pred = paddle.concat([x1, y1, x2, y2, conf, cls], axis=-1)
+                pred = pred.reshape([batch_size, -1, 5 + NUM_CLASSES])
+                preds.append(pred)
+            
+            # 合并多尺度预测
+            preds = paddle.concat(preds, axis=1)
+            
+            # 应用置信度阈值
+            for i in range(batch_size):
+                pred = preds[i]
+                mask = pred[:, 4] > conf_threshold
+                if mask.any():
+                    pred = pred[mask]
+                    # 非极大值抑制
+                    keep = nms(pred[:, :4], pred[:, 4], iou_threshold)
+                    pred = pred[keep]
+                    all_preds.append(pred)
+                else:
+                    all_preds.append(paddle.zeros((0, 5 + NUM_CLASSES)))
+    
+    # 计算评估指标
+    precision, recall, f1 = calculate_metrics(all_preds, all_targets, iou_threshold=0.5)
+    print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1-score: {f1:.4f}")
+    return precision, recall, f1
+
+def calculate_metrics(preds, targets, iou_threshold=0.5):
+    """计算精确率、召回率和F1分数"""
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+    
+    for pred, target in zip(preds, targets):
+        if len(pred) == 0 and len(target) == 0:
+            continue
+        elif len(pred) == 0:
+            total_fn += len(target)
+            continue
+        elif len(target) == 0:
+            total_fp += len(pred)
+            continue
+        
+        # 计算所有预测框与真实框的IoU
+        ious = []
+        for p in pred:
+            iou = box_iou(p[None, :4], target[:, 1:5])
+            ious.append(iou.numpy())
+        
+        ious = np.array(ious)
+        detected = np.zeros(len(target))
+        tp = 0
+        
+        # 按置信度排序
+        pred_indices = np.argsort(pred[:, 4].numpy())[::-1]
+        
+        for i in pred_indices:
+            max_iou = np.max(ious[i])
+            max_idx = np.argmax(ious[i])
+            
+            if max_iou > iou_threshold and not detected[max_idx]:
+                tp += 1
+                detected[max_idx] = 1
+        
+        fp = len(pred) - tp
+        fn = len(target) - np.sum(detected)
+        
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
+    
+    # 计算指标
+    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+    recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    
+    return precision, recall, f1
+
+# 可视化函数
+def visualize_predictions(model, dataset, num_samples=5, conf_threshold=0.5):
+    """可视化模型预测结果"""
+    model.eval()
+    fig, axes = plt.subplots(num_samples, 1, figsize=(10, num_samples*6))
+    
+    with paddle.no_grad():
+        for i in range(num_samples):
+            img, targets = dataset[i]
+            img_np = img.numpy().transpose((1, 2, 0))  # CHW to HWC
+            
+            # 获取预测结果
+            pred = model(img[None, ...])
+            
+            # 处理预测结果
+            all_boxes = []
+            all_scores = []
+            
+            # 修正：使用enumerate获取尺度索引
+            for scale_idx, out in enumerate(pred):
+                batch_size, _, grid_h, grid_w = out.shape
+                stride = IMG_SIZE / grid_h
+                mask = ANCHOR_MASKS[scale_idx]
+                anchors = paddle.to_tensor(ANCHORS, dtype=paddle.float32)[mask].reshape([-1, 2])
+                
+                # 重塑输出
+                out = out.reshape([batch_size, 3, 5 + NUM_CLASSES, grid_h, grid_w])
+                out = out.transpose([0, 1, 3, 4, 2])
+                
+                # 解析预测结果
+                xy = paddle.sigmoid(out[..., :2])
+                wh = paddle.exp(out[..., 2:4]) * anchors.reshape([1, 3, 1, 1, 2])
+                conf = paddle.sigmoid(out[..., 4])
+                
+                # 生成网格坐标（修正维度）
+                grid_x = paddle.arange(grid_w).reshape([1, 1, 1, grid_w, 1]).tile([batch_size, 3, grid_h, 1, 1])
+                grid_y = paddle.arange(grid_h).reshape([1, 1, grid_h, 1, 1]).tile([batch_size, 3, 1, grid_w, 1])
+                
+                # 计算绝对坐标
+                x = (xy[..., 0] + grid_x[..., 0]) * stride
+                y = (xy[..., 1] + grid_y[..., 0]) * stride
+                w = wh[..., 0]
+                h = wh[..., 1]
+                
+                # 转换为x1, y1, x2, y2格式
+                x1 = x - w / 2
+                y1 = y - h / 2
+                x2 = x + w / 2
+                y2 = y + h / 2
+                
+                # 过滤置信度阈值并收集结果
+                mask_conf = conf > conf_threshold
+                if mask_conf.any():
+                    boxes = paddle.stack([
+                        x1[mask_conf], y1[mask_conf], 
+                        x2[mask_conf], y2[mask_conf]
+                    ], axis=1)
+                    scores = conf[mask_conf]
+                    all_boxes.append(boxes.numpy())
+                    all_scores.append(scores.numpy())
+            
+            # 合并多尺度结果并应用非极大值抑制
+            if all_boxes:
+                boxes = paddle.to_tensor(np.concatenate(all_boxes, axis=0))
+                scores = paddle.to_tensor(np.concatenate(all_scores, axis=0))
+                keep = nms(boxes, scores)
+                boxes = boxes[keep].numpy()
+            else:
+                boxes = []
+            
+            # 绘制图像和边界框
+            axes[i].imshow(img_np)
+            axes[i].set_title(f'Prediction Example {i+1}')
+            axes[i].axis('off')
+            
+            # 绘制预测框
+            for box in boxes:
+                x1, y1, x2, y2 = box
+                rect = Rectangle((x1, y1), x2-x1, y2-y1, 
+                                fill=False, color='red', linewidth=2)
+                axes[i].add_patch(rect)
+            
+            # 绘制真实框
+            for tgt in targets.numpy():
+                cls_id, cx, cy, w, h = tgt
+                x1 = (cx - w/2) * IMG_SIZE
+                y1 = (cy - h/2) * IMG_SIZE
+                x2 = (cx + w/2) * IMG_SIZE
+                y2 = (cy + h/2) * IMG_SIZE
+                rect = Rectangle((x1, y1), x2-x1, y2-y1, 
+                                fill=False, color='green', linewidth=2, linestyle='--')
+                axes[i].add_patch(rect)
+    
+    plt.tight_layout()
+    plt.savefig('prediction_examples.png')
+    plt.show()
+
+# 主函数
+def main():
+    # 创建数据加载器
+    train_loader, val_loader, test_loader = create_data_loaders()
+    print(f"训练集大小: {len(train_loader.dataset)}, "
+          f"验证集大小: {len(val_loader.dataset)}, "
+          f"测试集大小: {len(test_loader.dataset)}")
+    
+    # 可视化数据增强效果
+    print("可视化数据增强效果...")
+    visualize_augmentations(train_loader.dataset)
+    
+    # 创建模型
+    print("创建YOLOv5模型...")
+    model = YOLOv5(num_classes=NUM_CLASSES)
+    
+    # 定义优化器、损失函数和学习率调度器
+    optimizer = paddle.optimizer.Adam(
+        learning_rate=LEARNING_RATE,
+        parameters=model.parameters(),
+        weight_decay=0.0005
+    )
+    scheduler = paddle.optimizer.lr.MultiStepDecay(
+        learning_rate=optimizer.get_lr(),
+        milestones=[20, 40],
+        gamma=0.1
+    )
+    criterion = YOLOLoss(num_classes=NUM_CLASSES)
+    
+    # 训练模型
+    print("开始训练模型...")
+    train_losses, val_losses = train_model(
+        model, train_loader, val_loader, 
+        optimizer, criterion, scheduler, NUM_EPOCHS
+    )
+    
+    # 绘制损失曲线
+    plot_loss_curves(train_losses, val_losses)
+    
+    # 加载最佳模型
+    best_model_path = os.path.join("models", "best_model.pdparams")
+    if os.path.exists(best_model_path):
+        checkpoint = paddle.load(best_model_path)
+        model.set_state_dict(checkpoint['model_state_dict'])
+        print(f"加载最佳模型（第{checkpoint['epoch']+1}轮）")
+    
+    # 评估模型
+    print("评估模型性能...")
+    precision, recall, f1 = evaluate_model(model, test_loader)
+    print(f"评估结果 - Precision: {precision:.4f}, Recall: {recall:.4f}, F1-score: {f1:.4f}")
+    
+    # 可视化预测结果
+    print("可视化预测结果...")
+    visualize_predictions(model, test_loader.dataset)
+
+if __name__ == "__main__":
+    main()
