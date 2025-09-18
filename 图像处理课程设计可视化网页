@@ -1,0 +1,689 @@
+# 蜜蜂检测Streamlit代码
+import os
+import cv2
+import numpy as np
+import warnings
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
+import streamlit as st
+import matplotlib.pyplot as plt
+import pandas as pd
+import io
+
+
+plt.switch_backend('Agg')
+
+# -------------------------- 1. 全局配置类 --------------------------
+class Config:
+    CONF_THRESHOLD = 0.3
+    DATA_ROOT = "/home/aistudio/bee_dataset"
+    MODEL_PATH = "/home/aistudio/models/best_model.pdparams"
+    NUM_ANCHORS = 5
+    TARGET_SIZE = (224, 224)
+    IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp')
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="paddle.nn.layer.norm")
+
+# -------------------------- 2. 工具函数 --------------------------
+def draw_boxes(img, boxes, color=(0, 255, 0), text_color=(255, 255, 255)):
+    img_copy = img.copy()
+    h, w = img_copy.shape[:2]
+    for box in boxes:
+        if len(box) == 5:
+            x1, y1, x2, y2, conf = box
+            label = f"{conf:.2f}"
+        else:
+            x1, y1, x2, y2 = box
+            label = ""
+        
+        x1, y1, x2, y2 = int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
+        x1 = max(0, min(x1, w-1))
+        y1 = max(0, min(y1, h-1))
+        x2 = max(0, min(x2, w-1))
+        y2 = max(0, min(y2, h-1))
+        
+        cv2.rectangle(img_copy, (x1, y1), (x2, y2), color, 2)
+        if label:
+            (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            text_x, text_y = x1, y1 - 10 if y1 > 10 else y1 + text_h + 5
+            cv2.rectangle(img_copy, (text_x, text_y - text_h), (text_x + text_w, text_y), color, -1)
+            cv2.putText(img_copy, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+    return img_copy
+
+# -------------------------- 3. 数据集类 --------------------------
+class BeeDataset:
+    def __init__(self, root_dir, split):
+        self.root_dir = root_dir
+        self.split = split
+        self.images_dir = os.path.join(root_dir, split)
+        self.ann_file = os.path.join(self.images_dir, "_annotations.coco.json")
+        self.image_files = self._get_valid_images()
+        # 加载标注并收集状态信息而非直接显示
+        self.annotations, self.load_status = self._load_coco_annotations()
+
+    def _get_valid_images(self):
+        if not os.path.exists(self.images_dir):
+            # 返回状态信息而非直接调用st.warning
+            return []
+        return [f for f in os.listdir(self.images_dir) if f.lower().endswith(Config.IMAGE_EXTENSIONS)]
+
+    def _load_coco_annotations(self):
+        ann_map = {}
+        status = {"success": True, "message": ""}
+        if not os.path.exists(self.ann_file):
+            status = {
+                "success": False, 
+                "message": f"标注文件不存在：{self.ann_file}（将使用空标注）"
+            }
+            return ann_map, status
+        
+        try:
+            import json
+            with open(self.ann_file, 'r', encoding='utf-8') as f:
+                coco = json.load(f)
+            
+            img_id_to_name = {img['id']: img['file_name'] for img in coco['images']}
+            img_id_to_boxes = {}
+            for ann in coco['annotations']:
+                if ann.get('category_id', 0) != 1:
+                    continue
+                img_id = ann['image_id']
+                x1, y1, w, h = ann['bbox']
+                x2, y2 = x1 + w, y1 + h
+                img_id_to_boxes.setdefault(img_id, []).append([x1, y1, x2, y2])
+            
+            for img_id, boxes in img_id_to_boxes.items():
+                fname = img_id_to_name.get(img_id)
+                if not fname or fname not in self.image_files:
+                    continue
+                img_path = os.path.join(self.images_dir, fname)
+                img = cv2.imread(img_path)
+                if img is None:
+                    continue
+                h, w = img.shape[:2]
+                norm_boxes = [[x1/w, y1/h, x2/w, y2/h] for x1,y1,x2,y2 in boxes]
+                ann_map[fname] = norm_boxes
+            
+            status["message"] = f"{self.split}集：加载{len(ann_map)}张带标注图像"
+            return ann_map, status
+        except Exception as e:
+            status = {
+                "success": False, 
+                "message": f"加载标注失败：{str(e)}（将使用空标注）"
+            }
+            return ann_map, status
+
+    def get_image(self, fname):
+        img_path = os.path.join(self.images_dir, fname)
+        img = cv2.imread(img_path)
+        if img is None:
+            
+            return np.ones((*Config.TARGET_SIZE, 3), dtype=np.uint8) * 240, [], f"图像加载失败：{fname}"
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h, w = img_rgb.shape[:2]
+        norm_boxes = self.annotations.get(fname, [])
+        real_boxes = [[x1*w, y1*h, x2*w, y2*h] for x1,y1,x2,y2 in norm_boxes]
+        return img_rgb, real_boxes, ""
+
+# -------------------------- 4. 检测模型类 --------------------------
+class ConvBlock(nn.Layer):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv2D(in_channels, out_channels, 3, 1, 1)
+        self.bn = nn.BatchNorm2D(out_channels)
+        self.relu = nn.ReLU()
+        self.pool = nn.MaxPool2D(2, 2)
+
+    def forward(self, x):
+        return self.pool(self.relu(self.bn(self.conv(x))))
+
+class FeatureExtractor(nn.Layer):
+    def __init__(self):
+        super().__init__()
+        self.block1 = ConvBlock(3, 16)
+        self.block2 = ConvBlock(16, 32)
+        self.block3 = ConvBlock(32, 64)
+        self.block4 = ConvBlock(64, 128)
+        self.block5 = ConvBlock(128, 256)
+
+    def forward(self, x):
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+        x = self.block5(x)
+        return x
+
+class BboxPredictor(nn.Layer):
+    def __init__(self, in_features, num_anchors=5):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, 1024)
+        self.dropout1 = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(1024, 7*7*num_anchors*5)
+
+    def forward(self, x):
+        batch_size = x.shape[0]
+        x_flatten = paddle.flatten(x, 1)
+        x = F.relu(self.fc1(x_flatten))
+        x = self.dropout1(x)
+        x = self.fc2(x)
+        return paddle.reshape(x, [batch_size, 7, 7, 5, 5])
+
+class BeeDetectionModel(nn.Layer):
+    def __init__(self, num_anchors=5):
+        super().__init__()
+        self.feature_extractor = FeatureExtractor()
+        with paddle.no_grad():
+            test_input = paddle.randn([1, 3, *Config.TARGET_SIZE], dtype='float32')
+            test_feature = self.feature_extractor(test_input)
+            in_features = test_feature.numel().item()
+        self.bbox_predictor = BboxPredictor(in_features, num_anchors)
+        self.anchors = self._init_anchors(num_anchors)
+
+    def _init_anchors(self, num_anchors):
+        anchors_init = [[0.2,0.2], [0.4,0.4], [0.6,0.6], [0.8,0.8], [1.0,1.0]]
+        anchor_status = {"warning": ""}
+        if num_anchors != len(anchors_init):
+            anchor_status["warning"] = f"锚框数量不匹配，自动调整为{len(anchors_init)}"
+            anchors_init = anchors_init[:num_anchors]
+        anchors_tensor = paddle.to_tensor(anchors_init, dtype='float32')
+        anchors_param = self.create_parameter(
+            shape=anchors_tensor.shape,
+            dtype=anchors_tensor.dtype,
+            default_initializer=nn.initializer.Assign(anchors_tensor)
+        )
+        self.add_parameter('anchors_param', anchors_param)
+        return anchors_param, anchor_status
+
+    def forward(self, x):
+        features = self.feature_extractor(x)
+        pred = self.bbox_predictor(features)
+        return pred[..., :4], F.sigmoid(pred[..., 4:]), self.anchors
+
+# -------------------------- 5. 核心功能函数 --------------------------
+def predict_image(model, input_img, conf_threshold):
+    img_resized = cv2.resize(input_img, Config.TARGET_SIZE)
+    img_norm = img_resized / 255.0
+    img_chw = np.transpose(img_norm, (2, 0, 1))
+    input_tensor = paddle.to_tensor(img_chw[np.newaxis, ...], dtype='float32')
+
+    with paddle.no_grad():
+        bbox_pred, conf_pred, anchors = model(input_tensor)
+
+    pred_boxes = []
+    bbox_np = bbox_pred.numpy()[0]
+    conf_np = conf_pred.numpy()[0]
+    anchors_np = anchors[0].numpy()  
+    img_h, img_w = input_img.shape[:2]
+
+    for grid_y in range(7):
+        for grid_x in range(7):
+            for anchor_idx in range(anchors_np.shape[0]):
+                conf = conf_np[grid_y, grid_x, anchor_idx, 0]
+                if conf < conf_threshold:
+                    continue
+                
+                tx, ty, tw, th = bbox_np[grid_y, grid_x, anchor_idx]
+                cx = (grid_x + tx) / 7
+                cy = (grid_y + ty) / 7
+                anchor_w, anchor_h = anchors_np[anchor_idx]
+                w = anchor_w * np.exp(tw)
+                h = anchor_h * np.exp(th)
+                
+                x1 = (cx - w/2) * img_w
+                y1 = (cy - h/2) * img_h
+                x2 = (cx + w/2) * img_w
+                y2 = (cy + h/2) * img_h
+                pred_boxes.append((x1, y1, x2, y2, conf))
+    
+    return pred_boxes
+
+def get_dataset_stats(train_dataset, valid_dataset, test_dataset):
+    def count_bees(dataset):
+        total = 0
+        sample_num = min(50, len(dataset.image_files))
+        for fname in dataset.image_files[:sample_num]:
+            total += len(dataset.annotations.get(fname, []))
+        return total * len(dataset.image_files) // sample_num if sample_num > 0 else 0
+
+    train_img = len(train_dataset.image_files)
+    valid_img = len(valid_dataset.image_files)
+    test_img = len(test_dataset.image_files)
+    total_img = train_img + valid_img + test_img
+
+    train_bee = count_bees(train_dataset)
+    valid_bee = count_bees(valid_dataset)
+    test_bee = count_bees(test_dataset)
+    total_bee = train_bee + valid_bee + test_bee
+
+    return {
+        "split": ["训练集", "验证集", "测试集", "总计"],
+        "image_count": [train_img, valid_img, test_img, total_img],
+        "bee_count": [train_bee, valid_bee, test_bee, total_bee],
+        "avg_bees_per_image": [
+            round(train_bee/train_img, 2) if train_img>0 else 0,
+            round(valid_bee/valid_img, 2) if valid_img>0 else 0,
+            round(test_bee/test_img, 2) if test_img>0 else 0,
+            round(total_bee/total_img, 2) if total_img>0 else 0
+        ]
+    }
+
+# -------------------------- 6. 资源初始化 --------------------------
+@st.cache(allow_output_mutation=True)
+def init_resources():
+    """仅初始化资源，返回所有需要的状态信息但不直接进行UI交互"""
+    try:
+        # 加载数据集并收集状态信息
+        train_dataset = BeeDataset(Config.DATA_ROOT, "train")
+        valid_dataset = BeeDataset(Config.DATA_ROOT, "valid")
+        test_dataset = BeeDataset(Config.DATA_ROOT, "test")
+        
+        # 收集数据集加载状态
+        dataset_statuses = [
+            train_dataset.load_status,
+            valid_dataset.load_status,
+            test_dataset.load_status
+        ]
+
+        # 初始化模型
+        model = BeeDetectionModel(Config.NUM_ANCHORS)
+        model_loaded = False
+        model_msg = ""
+        if os.path.exists(Config.MODEL_PATH):
+            try:
+                model.set_state_dict(paddle.load(Config.MODEL_PATH))
+                model_loaded = True
+                model_msg = f"成功加载预训练模型：{Config.MODEL_PATH}"
+            except Exception as e:
+                model_msg = f"加载模型失败：{str(e)}，使用随机初始化权重"
+        else:
+            model_msg = f"未找到预训练模型，使用随机初始化权重（路径：{Config.MODEL_PATH}）"
+        model.eval()
+
+        # 获取锚框状态信息
+        anchor_status = model.anchors[1]  # 从模型获取锚框状态
+
+        # 计算数据集统计
+        dataset_stats = get_dataset_stats(train_dataset, valid_dataset, test_dataset)
+
+        # 返回所有必要信息和状态
+        return {
+            "datasets": (train_dataset, valid_dataset, test_dataset),
+            "model": model,
+            "dataset_stats": dataset_stats,
+            "status": "success",
+            "messages": {
+                "dataset": dataset_statuses,
+                "model": model_msg,
+                "anchor": anchor_status["warning"]
+            }
+        }
+
+    except Exception as e:
+        return {
+            "datasets": None,
+            "model": None,
+            "dataset_stats": None,
+            "status": "error",
+            "messages": {"error": str(e)}
+        }
+
+# -------------------------- 7. 主界面（所有UI交互在此处处理） --------------------------
+def main():
+    st.set_page_config(
+        page_title="🐝 蜜蜂检测可视化平台",
+        page_icon="🐝",
+        layout="wide",
+        initial_sidebar_state="collapsed"
+    )
+    st.title("🐝 蜜蜂检测可视化平台")
+    st.markdown("---")
+
+    # 显示初始化进度
+    init_status = st.empty()
+    init_status.info("正在初始化资源，请稍候...")
+
+    # 调用缓存函数
+    resources = init_resources()
+
+    # 处理初始化结果并显示UI反馈
+    if resources["status"] == "success":
+        train_dataset, valid_dataset, test_dataset = resources["datasets"]
+        model = resources["model"]
+        dataset_stats = resources["dataset_stats"]
+        
+        # 显示数据集加载状态
+        for status in resources["messages"]["dataset"]:
+            if status["success"]:
+                st.success(status["message"])
+            else:
+                st.warning(status["message"])
+        
+        # 显示模型加载状态
+        if "成功加载" in resources["messages"]["model"]:
+            st.success(resources["messages"]["model"])
+        else:
+            st.warning(resources["messages"]["model"])
+        
+        # 显示锚框状态
+        if resources["messages"]["anchor"]:
+            st.warning(resources["messages"]["anchor"])
+        
+        init_status.success("🎉 所有资源初始化完成！")
+    else:
+        init_status.error(f"❌ 资源初始化失败：{resources['messages']['error']}")
+        
+        class DummyDataset:
+            def __init__(self):
+                self.image_files = []
+                self.annotations = {}
+                self.load_status = {"success": False, "message": "使用默认空数据集"}
+            def get_image(self, fname):
+                return np.ones((*Config.TARGET_SIZE, 3), dtype=np.uint8)*240, [], ""
+        dummy_ds = DummyDataset()
+        train_dataset = valid_dataset = test_dataset = dummy_ds
+        model = BeeDetectionModel()
+        model.eval()
+        dataset_stats = {
+            "split": ["训练集", "验证集", "测试集", "总计"],
+            "image_count": [0, 0, 0, 0],
+            "bee_count": [0, 0, 0, 0],
+            "avg_bees_per_image": [0.0, 0.0, 0.0, 0.0]
+        }
+
+    # 标签页导航
+    tab1, tab2, tab3 = st.tabs(["1. 数据集统计", "2. 图像浏览", "3. 实时检测"])
+
+    with tab1:
+       st.subheader("📊 Dataset Distribution Overview")
+       st.markdown("### Basic Statistics Table")
+       stats_df = pd.DataFrame(dataset_stats)
+       st.dataframe(stats_df, use_container_width=True)
+
+       st.markdown("### Number of Images in Each Dataset")
+       fig1, ax1 = plt.subplots(figsize=(8, 4))
+       splits = dataset_stats["split"][:-1]
+       img_counts = dataset_stats["image_count"][:-1]
+       colors1 = ["#FF6B6B", "#4ECDC4", "#45B7D1"]
+       bars1 = ax1.bar(splits, img_counts, color=colors1, alpha=0.8, edgecolor="white", linewidth=2)
+      
+       for bar, count in zip(bars1, img_counts):
+           height = bar.get_height()
+           ax1.text(
+               bar.get_x() + bar.get_width()/2., height + max(img_counts)*0.01,
+               str(count), ha="center", va="bottom", fontsize=12, fontweight="bold"
+           )
+      
+       ax1.set_ylabel("Number of Images", fontsize=12, fontweight="bold")
+       ax1.set_title("Image Distribution in Train/Validation/Test Sets", fontsize=14, fontweight="bold", pad=20)
+       ax1.grid(axis="y", alpha=0.3, linestyle="--")
+       plt.tight_layout()
+       st.pyplot(fig1)
+
+       st.markdown("### Proportion of Bee Counts by Dataset")
+       fig2, ax2 = plt.subplots(figsize=(6, 6))
+       bee_counts = dataset_stats["bee_count"][:-1]
+       colors2 = ["#FF6B6B", "#4ECDC4", "#45B7D1"]
+       wedges, texts, autotexts = ax2.pie(
+           bee_counts, labels=splits, colors=colors2, autopct="%1.1f%%",
+           startangle=90, textprops={"fontsize": 12}, wedgeprops={"edgecolor": "white", "linewidth": 2}
+       )
+      
+       for autotext in autotexts:
+           autotext.set_color("white")
+           autotext.set_fontweight("bold")
+      
+       ax2.set_title("Proportion of Bee Counts by Dataset", fontsize=14, fontweight="bold", pad=20)
+       plt.tight_layout()
+       st.pyplot(fig2)
+
+    with tab2:
+        st.subheader("🔍 蜜蜂图像浏览（绿色框为真实标注）")
+        
+        st.markdown("#### 筛选条件")
+        
+        split_col, keyword_col = st.columns(2)
+        with split_col:
+            selected_split = st.selectbox(
+                "选择数据集",
+                options=["训练集", "验证集", "测试集"],
+                index=0,
+                help="选择要浏览的数据集划分"
+            )
+        with keyword_col:
+            search_keyword = st.text_input(
+                "文件名关键词",
+                placeholder="例如：bee_001、2024",
+                help="输入文件名包含的关键词进行检索"
+            )
+        
+        
+        slider_col, btn_col = st.columns([2, 1])
+        with slider_col:
+            max_display = st.slider(
+                "最多显示数量",
+                min_value=3,
+                max_value=30,
+                value=12,
+                step=3,
+                help="控制显示的图像数量"
+            )
+        with btn_col:
+            if st.button("🔄 刷新图像"):
+                st.experimental_rerun()
+
+        # 分割线分隔筛选区和图像区
+        st.markdown("---")
+        st.markdown("#### 图像展示")
+
+        
+        if selected_split == "训练集":
+            current_ds = train_dataset
+        elif selected_split == "验证集":
+            current_ds = valid_dataset
+        else:
+            current_ds = test_dataset
+
+        # 筛选匹配的图像
+        matched_files = []
+        for fname in current_ds.image_files:
+            if search_keyword.lower() in fname.lower():
+                matched_files.append(fname)
+            if len(matched_files) >= max_display:
+                break
+
+        # 处理无图像/无匹配的情况
+        if not current_ds.image_files:
+            st.warning("⚠️ 当前数据集无图像文件，请检查数据集路径！")
+            placeholder = np.ones((300, 400, 3), dtype=np.uint8)*240
+            st.image(placeholder, caption="无图像数据", width=400)
+        elif not matched_files:
+            st.warning(f"⚠️ 未找到包含关键词「{search_keyword}」的图像")
+            placeholder = np.ones((300, 400, 3), dtype=np.uint8)*240
+            st.image(placeholder, caption="无匹配图像", width=400)
+        else:
+            st.success(f"✅ 找到 {len(matched_files)} 张匹配图像（共{len(current_ds.image_files)}张）")
+            
+            
+            for i in range(0, len(matched_files), 3):
+                
+                row_imgs = matched_files[i:i+3]
+                img_col1, img_col2, img_col3 = st.columns(3)
+                
+                # 第一张图
+                with img_col1:
+                    fname = row_imgs[0]
+                    img_rgb, real_boxes, error_msg = current_ds.get_image(fname)
+                    if error_msg:
+                        st.error(error_msg)
+                    img_with_boxes = draw_boxes(img_rgb, real_boxes, color=(0, 255, 0))
+                    st.image(
+                        img_with_boxes,
+                        caption=f"{os.path.basename(fname)}\n蜜蜂数量：{len(real_boxes)}",
+                        use_column_width=True,
+                        clamp=True
+                    )
+                
+                # 第二张图
+                if len(row_imgs) >= 2:
+                    with img_col2:
+                        fname = row_imgs[1]
+                        img_rgb, real_boxes, error_msg = current_ds.get_image(fname)
+                        if error_msg:
+                            st.error(error_msg)
+                        img_with_boxes = draw_boxes(img_rgb, real_boxes, color=(0, 255, 0))
+                        st.image(
+                            img_with_boxes,
+                            caption=f"{os.path.basename(fname)}\n蜜蜂数量：{len(real_boxes)}",
+                            use_column_width=True,
+                            clamp=True
+                        )
+                
+                # 第三张图
+                if len(row_imgs) >= 3:
+                    with img_col3:
+                        fname = row_imgs[2]
+                        img_rgb, real_boxes, error_msg = current_ds.get_image(fname)
+                        if error_msg:
+                            st.error(error_msg)
+                        img_with_boxes = draw_boxes(img_rgb, real_boxes, color=(0, 255, 0))
+                        st.image(
+                            img_with_boxes,
+                            caption=f"{os.path.basename(fname)}\n蜜蜂数量：{len(real_boxes)}",
+                            use_column_width=True,
+                            clamp=True
+                        )
+                
+                # 每行结束后加空行分隔
+                st.markdown("")
+
+    with tab3:
+        st.subheader("📸 蜜蜂实时检测（红色框为预测结果）")
+        
+        st.markdown("#### 检测设置")
+        upload_col, threshold_col = st.columns([2, 1])  
+        with upload_col:
+            uploaded_file = st.file_uploader(
+                "选择图像文件",
+                type=["png", "jpg", "jpeg", "bmp"],
+                help="上传包含蜜蜂的图像文件（推荐尺寸：500-1000px）"
+            )
+        with threshold_col:
+            conf_threshold = st.slider(
+                "检测置信度阈值",
+                min_value=0.1,
+                max_value=0.9,
+                value=Config.CONF_THRESHOLD,
+                step=0.05,
+                help="值越高，检测结果越严格（减少误检）；值越低，检测越灵敏（可能增加误检）"
+            )
+        
+        
+        btn_col1, btn_col2 = st.columns([1, 1]) 
+        with btn_col1:
+            
+            detect_btn = st.button(
+                "🚀 开始检测",
+                disabled=not uploaded_file  # 无文件时禁用按钮
+            )
+        with btn_col2:
+            
+            if st.button("🔄 重置"):
+                st.experimental_rerun()
+
+        
+        st.markdown("---")
+        st.markdown("#### 检测结果")
+        
+        
+        result_placeholder = st.empty()
+        info_placeholder = st.empty()
+
+        # 初始状态：显示"等待检测"提示图
+        with result_placeholder:
+            init_placeholder = np.ones((400, 600, 3), dtype=np.uint8) * 240  
+            
+            cv2.putText(
+                init_placeholder, "",
+                (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 100, 100), 2, cv2.LINE_AA
+            )
+            st.image(init_placeholder, caption="等待检测", width=600)
+        
+       
+        with info_placeholder:
+            st.info("ℹ️ 支持格式：PNG/JPG/JPEG/BMP，建议图像中蜜蜂清晰可见")
+
+        # 检测逻辑：点击"开始检测"且有上传文件时执行
+        if detect_btn and uploaded_file:
+            try:
+                 
+                
+                uploaded_bytes = uploaded_file.read()
+                
+                img_array = np.asarray(bytearray(uploaded_bytes), dtype=np.uint8)
+               
+                img_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                #------------------------------------------------------------------------------------------
+                
+                # 检查图像解码是否成功
+                if img_bgr is None:
+                    raise ValueError("图像解码失败，文件可能损坏或格式不支持")
+                
+                # 转换颜色空间
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+                # 执行检测（显示加载中提示）
+                with st.spinner("🔍 正在检测蜜蜂..."):
+                    pred_boxes = predict_image(model, img_rgb, conf_threshold)
+
+                # 绘制预测框（红色框：(255,0,0)）
+                img_with_pred = draw_boxes(img_rgb, pred_boxes, color=(255, 0, 0))
+
+                # 更新结果区：显示检测后的图像
+                with result_placeholder:
+                    st.image(
+                        img_with_pred,
+                        caption=f"检测结果（置信度阈值：{conf_threshold}）",
+                        width=600,
+                        clamp=True  # 防止图像溢出
+                    )
+                
+                # 更新信息区：显示检测统计结果
+                with info_placeholder:
+                    if pred_boxes:
+                        max_conf = max([box[4] for box in pred_boxes])  # 最高置信度
+                        st.success(f"""
+                        🎉 检测完成！
+                        - 共识别到 **{len(pred_boxes)} 只蜜蜂**
+                        - 最高置信度：{max_conf:.2f}
+                        - 置信度阈值：{conf_threshold}
+                        """)
+                    else:
+                        st.warning(f"""
+                        ⚠️ 未识别到蜜蜂
+                        - 建议：降低置信度阈值（当前：{conf_threshold}），或上传蜜蜂更清晰的图像
+                        - 检查：确保图像中蜜蜂尺寸适中（避免过小或过大）
+                        """)
+
+            # 捕获检测过程中的所有异常
+            except Exception as e:
+                # 异常状态：显示错误提示图
+                with result_placeholder:
+                    error_placeholder = np.ones((400, 600, 3), dtype=np.uint8) * 240
+                    cv2.putText(
+                        error_placeholder, "检测出错！",
+                        (180, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 0, 0), 3, cv2.LINE_AA
+                    )
+                    cv2.putText(
+                        error_placeholder, str(e),
+                        (50, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2, cv2.LINE_AA
+                    )
+                    st.image(error_placeholder, caption="检测错误", width=600)
+                
+                # 异常信息提示
+                with info_placeholder:
+                    st.error(f"❌ 检测失败：{str(e)}")
+if __name__ == "__main__":
+    main()
